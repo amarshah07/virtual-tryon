@@ -1,0 +1,6 @@
+flask
+supabase
+requests
+pillow
+google-genai
+gunicorn
