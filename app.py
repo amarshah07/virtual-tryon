@@ -53,7 +53,7 @@ def upload_user_image():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- Try-on endpoint ---
+# --- Try-on endpoint: fixed upload ---
 @app.route("/tryon", methods=["POST"])
 def tryon():
     try:
@@ -69,43 +69,31 @@ def tryon():
             return jsonify({"status": "error", "message": "Image URLs missing"}), 400
 
         # download images
-        uresp = requests.get(user_image_url, timeout=15)
-        cresp = requests.get(cloth_image_url, timeout=15)
-        if uresp.status_code != 200:
-            return jsonify({"status": "error", "message": f"Failed to fetch user image: {uresp.status_code}"}), 400
-        if cresp.status_code != 200:
-            return jsonify({"status": "error", "message": f"Failed to fetch cloth image: {cresp.status_code}"}), 400
+        user_img = Image.open(BytesIO(requests.get(user_image_url).content)).convert("RGBA")
+        cloth_img = Image.open(BytesIO(requests.get(cloth_image_url).content)).convert("RGBA")
 
-        user_img = Image.open(BytesIO(uresp.content)).convert("RGBA")
-        cloth_img = Image.open(BytesIO(cresp.content)).convert("RGBA")
-
-        # --- Simple compositing ---
+        # composite cloth on user
         target_w = int(user_img.width * 0.7)
         scale = target_w / max(1, cloth_img.width)
         target_h = int(cloth_img.height * scale)
         cloth_resized = cloth_img.resize((target_w, target_h), Image.LANCZOS)
-
         x = int((user_img.width - target_w) / 2)
         y = int(user_img.height * 0.25)
-
         mask = cloth_resized.split()[3]
         if mask.getextrema() == (0, 0):
             gray = cloth_resized.convert("L")
             mask = gray.point(lambda p: 255 if p < 250 else 0)
-
         composed = user_img.copy()
         composed.paste(cloth_resized, (x, y), mask)
 
-        # --- Save to PNG bytes ---
+        # save bytes
         out_buf = BytesIO()
         composed.save(out_buf, format="PNG")
         out_buf.seek(0)
 
-        # upload to Supabase
+        # upload (fixed!)
         file_name = f"tryon_results/{user_id}_{product_id}_{int(time.time())}.png"
-        upload_res = supabase.storage.from_(BUCKET).upload(file_name, out_buf.read(), {"upsert": True})
-        if isinstance(upload_res, dict) and upload_res.get("error"):
-            return jsonify({"status": "error", "message": upload_res.get("error")}), 500
+        upload_res = supabase.storage.from_(BUCKET).upload(file_name, out_buf.read())
 
         result_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{file_name}"
 
@@ -124,6 +112,8 @@ def tryon():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
