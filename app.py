@@ -2,54 +2,96 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import requests
 from io import BytesIO
-from supabase import create_client
-from google import genai
+import base64
 import os
+from supabase import create_client, Client
+import google.generativeai as genai
 
+# --- Flask App ---
 app = Flask(__name__)
 
 # --- Supabase ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- Gemini ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 
-@app.route("/tryon", methods=["POST"])
+# --- Utility: Convert image to base64 ---
+def image_to_base64(img: Image.Image) -> str:
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok", "message": "Xaze Try-On Backend Running 🚀"})
+
 @app.route("/tryon", methods=["POST"])
 def tryon():
     try:
-        data = request.json
-        user_id = data.get("user_id")  # ✅ won’t crash if missing
+        data = request.json or {}
+        user_id = data.get("user_id")
         product_id = data.get("product_id")
         user_image_url = data.get("user_image_url")
         cloth_image_url = data.get("cloth_image_url")
 
+        if not user_id or not product_id:
+            return jsonify({"status": "error", "message": "user_id and product_id required"}), 400
         if not user_image_url or not cloth_image_url:
             return jsonify({"status": "error", "message": "Image URLs missing"}), 400
 
-        # your processing...
-        result_url = "https://your-supabase-bucket/tryon_results/sample.png"
+        # --- Download input images ---
+        user_img = Image.open(BytesIO(requests.get(user_image_url).content))
+        cloth_img = Image.open(BytesIO(requests.get(cloth_image_url).content))
 
-        return jsonify({"status": "success", "result_url": result_url})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # Convert to base64
+        user_b64 = image_to_base64(user_img)
+        cloth_b64 = image_to_base64(cloth_img)
 
+        # --- Gemini Prompt ---
+        prompt = """
+        Overlay the clothing item onto the person realistically,
+        making it look like they are wearing it. Match pose, proportions,
+        and preserve natural look.
+        """
 
-        output = Image.open(BytesIO(image_parts[0]))
+        # --- Call Gemini ---
+        model = genai.GenerativeModel("gemini-2.0-flash")  # or "gemini-2.5-flash-image"
+        response = model.generate_content([
+            {"mime_type": "image/png", "data": base64.b64decode(cloth_b64)},
+            {"mime_type": "image/png", "data": base64.b64decode(user_b64)},
+            prompt,
+        ])
 
-        # Save to Supabase Storage
+        # Extract generated image
+        if not response or not response.candidates:
+            return jsonify({"status": "error", "message": "No candidates returned"}), 400
+
+        img_data = None
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data.data:
+                img_data = base64.b64decode(part.inline_data.data)
+                break
+
+        if not img_data:
+            return jsonify({"status": "error", "message": "No image generated"}), 400
+
+        result_img = Image.open(BytesIO(img_data))
+
+        # --- Save to Supabase Storage ---
         file_name = f"tryon_results/{user_id}_{product_id}.png"
         buf = BytesIO()
-        output.save(buf, format="PNG")
+        result_img.save(buf, format="PNG")
         buf.seek(0)
+        supabase.storage.from_("images").upload(file_name, buf, {"upsert": True})
 
-        supabase.storage.from_("images").upload(file_name, buf)
+        # Public URL
         result_url = f"{SUPABASE_URL}/storage/v1/object/public/images/{file_name}"
 
-        # Save metadata to DB
+        # --- Save metadata ---
         supabase.table("tryon_results").insert({
             "user_id": user_id,
             "product_id": product_id,
@@ -63,7 +105,6 @@ def tryon():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Xaze Try-On Backend Running 🚀"
 
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
