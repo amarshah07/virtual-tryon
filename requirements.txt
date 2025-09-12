@@ -4,6 +4,6 @@ requests
 pillow
 google-genai
 gunicorn
-google-generativeai
-
+flask-cors
+pyjwt 
 
