@@ -1,1 +1,8 @@
-pip install flask flask-cors pillow supabase requests google-generativeai
+Flask==2.3.4
+flask-cors==4.2.0
+Pillow==10.0.0
+supabase==3.0.0
+requests==2.32.0
+gunicorn==21.2.0
+# optional if using Gemini
+google-generativeai==0.1.0
