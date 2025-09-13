@@ -14,16 +14,14 @@ import json
 # optional Google GenAI client
 try:
     from google import genai  # type: ignore
-    from google.genai import types # type: ignore
     _HAS_GENAI = True
 except Exception:
     genai = None
-    types = None
     _HAS_GENAI = False
 
 from supabase import create_client, Client
 
-app = Flask(__name__)
+app = Flask(_name_)
 CORS(app)
 
 # --- CONFIG (use environment variables in production) ---
@@ -33,6 +31,7 @@ BUCKET = os.environ.get("SUPABASE_BUCKET", "images")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCxAcqc8gBVOMAlO0veJPjmBch1kWBQpgI")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
+GEMINI_MODE = os.environ.get("GEMINI_MODE", "base64")  # not used heavily here
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Please set SUPABASE_URL and SUPABASE_KEY environment variables")
@@ -54,6 +53,7 @@ def _upload_to_supabase(bucket: str, path: str, file_bytes: bytes, content_type:
     Upload raw bytes to Supabase storage and return public URL.
     """
     try:
+        # supabase client expects bytes for upload
         upload_res = supabase.storage.from_(bucket).upload(path, file_bytes, {"upsert": "true"})
         if isinstance(upload_res, dict) and upload_res.get("error"):
             raise RuntimeError(f"Supabase upload error: {upload_res.get('error')}")
@@ -79,11 +79,14 @@ def send_to_gemini_images(user_image: Image.Image, cloth_image: Image.Image, ins
         model_name = GEMINI_MODEL or "gemini-2.5-flash-image-preview"
         if instruction is None:
             instruction = (
-                "Overlay the given clothing item onto the person realistically, "
-                "making it look like they are actually wearing it. Keep it clean and professional. "
-                "Check the fit and adjust the clothing item to match the person's pose and body shape. "
-                "Align clothing with shoulders, arms, and torso. Preserve correct proportions, blend shadows and lighting naturally. "
-                "Do not alter the person's face or background. Return only the final composite try-on image (inline image data)."
+                "Perform a virtual clothing try-on. Carefully overlay the clothing item "
+                "onto the person in a realistic manner. Pay close attention to:\n"
+                "1. Body proportions and pose alignment\n"
+                "2. Natural lighting and shadows\n"
+                "3. Proper fit around shoulders, arms, and torso\n"
+                "4. Do not cover the face or significantly alter the background\n"
+                "5. Maintain the original image quality and resolution\n"
+                "Return only the final composite image with the clothing properly fitted."
             )
 
         # Convert PIL images to PNG bytes (cloth first, then person - explicit)
@@ -94,8 +97,10 @@ def send_to_gemini_images(user_image: Image.Image, cloth_image: Image.Image, ins
         response = client.models.generate_content(
             model=model_name,
             contents=[
-                types.Part.from_bytes(data=cloth_bytes, mime_type='image/png'),
-                types.Part.from_bytes(data=user_bytes, mime_type='image/png'),
+                "This is a clothing item:",
+                cloth_bytes,
+                "This is a person:",
+                user_bytes,
                 instruction
             ],
         )
@@ -155,7 +160,7 @@ def upload_user_image():
                 return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         except Exception as e:
             traceback.print_exc()
-            return jsonify({"status": "error", "message": str(e), "type": str(e.__class__)}), 500
+            return jsonify({"status": "error", "message": str(e), "type": str(e._class_)}), 500
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
         return jsonify({"status": "success", "public_url": public_url, "file_path": filename})
@@ -196,33 +201,45 @@ def tryon():
             traceback.print_exc()
             return jsonify({"status": "error", "message": f"Invalid image data: {e}"}), 400
 
+        # Debug image info
+        print(f"User image size: {user_img.size}, mode: {user_img.mode}")
+        print(f"Cloth image size: {cloth_img.size}, mode: {cloth_img.mode}")
+
         # Prepare a local PIL fallback composed image (in case Gemini fails)
-        fallback_bytes = None
         try:
             base = user_img.copy()
-            target_w = int(base.width * 0.7)
-            scale = target_w / max(1, cloth_img.width)
+            
+            # Calculate better positioning based on human proportions
+            # Assuming the clothing is a top (shirt, t-shirt, etc.)
+            shoulder_width = int(base.width * 0.3)  # Estimate shoulder width
+            scale = shoulder_width / max(1, cloth_img.width)
+            target_w = int(cloth_img.width * scale)
             target_h = int(cloth_img.height * scale)
             cloth_resized = cloth_img.resize((target_w, target_h), Image.LANCZOS)
-
+            
+            # Better positioning - center on torso area
             x = int((base.width - target_w) / 2)
-            y = int(base.height * 0.25)
-
-            mask = cloth_resized.split()[3]
-            if mask.getextrema() == (0, 0):
+            y = int(base.height * 0.15)  # Start from upper body
+            
+            # Create a proper mask for transparency
+            if cloth_resized.mode == 'RGBA':
+                mask = cloth_resized.split()[3]
+            else:
+                # Create a mask from transparency or use the image itself
                 gray = cloth_resized.convert("L")
                 mask = gray.point(lambda p: 255 if p < 250 else 0)
-
+            
             composed = base.copy()
             composed.paste(cloth_resized, (x, y), mask)
             fallback_bytes = _pil_to_bytes(composed, fmt="PNG")
-        except Exception:
+        except Exception as e:
+            print(f"Fallback composition error: {e}")
             traceback.print_exc()
             fallback_bytes = None
 
         # Try Gemini (preferred)
         final_image_bytes = None
-        used_backend = "local_pil"
+        used_backend = None
 
         if _HAS_GENAI and GEMINI_API_KEY:
             try:
@@ -257,7 +274,7 @@ def tryon():
                 return jsonify({"status": "error", "message": "Both Gemini and local fallback failed"}), 500
 
         # Upload to Supabase storage
-        result_filename = f"tryon_results/{user_id}_{product_id}_{int(time.time())}.png"
+        result_filename = f"tryon_results/{user_id}{product_id}{int(time.time())}.png"
         try:
             upload_res = supabase.storage.from_(BUCKET).upload(result_filename, final_image_bytes, {"upsert": "true"})
             if isinstance(upload_res, dict) and upload_res.get("error"):
@@ -265,7 +282,7 @@ def tryon():
                 return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         except Exception as e:
             traceback.print_exc()
-            return jsonify({"status": "error", "message": str(e), "type": str(e.__class__)}), 500
+            return jsonify({"status": "error", "message": str(e), "type": str(e._class_)}), 500
 
         result_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{result_filename}"
 
@@ -287,6 +304,6 @@ def tryon():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
