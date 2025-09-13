@@ -1,9 +1,5 @@
 flask
+flask-cors
+pillow
 supabase
 requests
-pillow
-google-genai
-gunicorn
-flask-cors
-pyjwt 
-
