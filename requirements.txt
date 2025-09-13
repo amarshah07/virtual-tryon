@@ -1,5 +1,1 @@
-flask
-flask-cors
-pillow
-supabase
-requests
+pip install flask flask-cors pillow supabase requests google-generativeai
