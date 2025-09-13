@@ -14,9 +14,11 @@ import json
 # optional Google GenAI client
 try:
     from google import genai  # type: ignore
+    from google.genai import types # type: ignore
     _HAS_GENAI = True
 except Exception:
     genai = None
+    types = None
     _HAS_GENAI = False
 
 from supabase import create_client, Client
@@ -31,7 +33,6 @@ BUCKET = os.environ.get("SUPABASE_BUCKET", "images")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCxAcqc8gBVOMAlO0veJPjmBch1kWBQpgI")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
-GEMINI_MODE = os.environ.get("GEMINI_MODE", "base64")  # not used heavily here
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Please set SUPABASE_URL and SUPABASE_KEY environment variables")
@@ -53,7 +54,6 @@ def _upload_to_supabase(bucket: str, path: str, file_bytes: bytes, content_type:
     Upload raw bytes to Supabase storage and return public URL.
     """
     try:
-        # supabase client expects bytes for upload
         upload_res = supabase.storage.from_(bucket).upload(path, file_bytes, {"upsert": "true"})
         if isinstance(upload_res, dict) and upload_res.get("error"):
             raise RuntimeError(f"Supabase upload error: {upload_res.get('error')}")
@@ -93,7 +93,11 @@ def send_to_gemini_images(user_image: Image.Image, cloth_image: Image.Image, ins
         print("Calling Gemini model:", model_name)
         response = client.models.generate_content(
             model=model_name,
-            contents=[cloth_bytes, user_bytes, instruction],
+            contents=[
+                types.Part.from_bytes(data=cloth_bytes, mime_type='image/png'),
+                types.Part.from_bytes(data=user_bytes, mime_type='image/png'),
+                instruction
+            ],
         )
 
         # Try to extract inline image bytes
@@ -193,6 +197,7 @@ def tryon():
             return jsonify({"status": "error", "message": f"Invalid image data: {e}"}), 400
 
         # Prepare a local PIL fallback composed image (in case Gemini fails)
+        fallback_bytes = None
         try:
             base = user_img.copy()
             target_w = int(base.width * 0.7)
@@ -217,20 +222,14 @@ def tryon():
 
         # Try Gemini (preferred)
         final_image_bytes = None
-        used_backend = None
+        used_backend = "local_pil"
 
         if _HAS_GENAI and GEMINI_API_KEY:
             try:
                 gemini_resp = send_to_gemini_images(
                     user_img,
                     cloth_img,
-                    instruction=custom_instruction or (
-                        "Overlay the given clothing item onto the person realistically, "
-                        "making it look like they are actually wearing it. Keep it clean and professional. "
-                        "Check the fit and adjust the clothing item to match the person's pose and body shape. "
-                        "Align clothing with shoulders, arms, and torso. Preserve correct proportions, blend shadows and lighting naturally. "
-                        "Do not alter the person's face or background. Return only the final composite try-on image (inline image data)."
-                    )
+                    instruction=custom_instruction
                 )
                 print("gemini_resp keys:", list(gemini_resp.keys()))
             except Exception:
