@@ -1,9 +1,3 @@
-# app.py
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from PIL import Image
-import requests
-from io import BytesIO
 import os
 import time
 import traceback
@@ -23,6 +17,8 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CONFIG from env ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # service role key (secret) - required
 SUPABASE_URL = "https://xetomtmbtiqwfisynrrl.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhldG9tdG1idGlxd2Zpc3lucnJsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzM0ODk0MywiZXhwIjoyMDcyOTI0OTQzfQ.a4Oh7YnHyEqSrJrFNI3gYoGz0FUjE5aoMMCRKRDla_k"  # service role key (secret) - required 
 print(SUPABASE_KEY)                                                 
@@ -41,15 +37,7 @@ GEMINI_MODE = os.environ.get("GEMINI_MODE", "base64")
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "Xaze Try-On Backend Running 🚀"})
-
-# Upload user image endpoint (multipart/form-data)
-# Expects: 'file' form field, optional 'user_id'
-@app.route("/upload_user_image", methods=["POST"])
-def upload_user_image():
-    try:
-        if "file" not in request.files:
-            return jsonify({"status": "error", "message": "No file provided"}), 400
-
+@@ -36,6 +53,13 @@ def upload_user_image():
         file = request.files["file"]
         user_id = request.form.get("user_id", "anonymous")
 
@@ -63,11 +51,14 @@ def upload_user_image():
         # read bytes
         file_bytes = file.read()
         ext = "png"
-        if "." in file.filename:
-            ext = file.filename.rsplit(".", 1)[1]
+@@ -44,10 +68,17 @@ def upload_user_image():
         filename = f"user_uploads/{user_id}_{int(time.time())}.{ext}"
 
         # upload bytes to supabase storage (service role key on server)
+        upload_res = supabase.storage.from_(BUCKET).upload(filename, file_bytes, {"upsert": True})
+        # supabase-py may return dict with error, or object; check both
+        if isinstance(upload_res, dict) and upload_res.get("error"):
+            return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         try:
             # pass raw bytes (supabase client expects str/bytes/os.PathLike)
             upload_res = supabase.storage.from_(BUCKET).upload(filename, file_bytes, {"upsert": "true"})
@@ -82,18 +73,7 @@ def upload_user_image():
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
         return jsonify({"status": "success", "public_url": public_url, "file_path": filename})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# Try-on endpoint: expects JSON -> user_id, product_id, user_image_url, cloth_image_url
-@app.route("/tryon", methods=["POST"])
-def tryon():
-    try:
-        data = request.json or {}
-        user_id = data.get("user_id")
-        product_id = data.get("product_id")
+@@ -66,14 +97,33 @@ def tryon():
         user_image_url = data.get("user_image_url")
         cloth_image_url = data.get("cloth_image_url")
 
@@ -112,6 +92,8 @@ def tryon():
             return jsonify({"status": "error", "message": "cloth_image_url must be a string (public URL).", "type": str(type(cloth_image_url))}), 400
 
         # Download both images (timeout)
+        uresp = requests.get(user_image_url, timeout=15)
+        cresp = requests.get(cloth_image_url, timeout=15)
         try:
             uresp = requests.get(user_image_url, timeout=15)
         except Exception as e:
@@ -127,32 +109,7 @@ def tryon():
         if uresp.status_code != 200:
             return jsonify({"status": "error", "message": f"Failed to fetch user image: {uresp.status_code}"}), 400
         if cresp.status_code != 200:
-            return jsonify({"status": "error", "message": f"Failed to fetch cloth image: {cresp.status_code}"}), 400
-
-        user_img = Image.open(BytesIO(uresp.content)).convert("RGBA")
-        cloth_img = Image.open(BytesIO(cresp.content)).convert("RGBA")
-
-        # Simple compositing demo: scale clothing and paste on torso area
-        target_w = int(user_img.width * 0.7)
-        scale = target_w / max(1, cloth_img.width)
-        target_h = int(cloth_img.height * scale)
-        cloth_resized = cloth_img.resize((target_w, target_h), Image.LANCZOS)
-
-        x = int((user_img.width - target_w) / 2)
-        y = int(user_img.height * 0.25)
-
-        # If cloth has alpha, use it; otherwise build mask by threshold
-        mask = cloth_resized.split()[3]
-        if mask.getextrema() == (0, 0):
-            gray = cloth_resized.convert("L")
-            mask = gray.point(lambda p: 255 if p < 250 else 0)
-
-        composed = user_img.copy()
-        composed.paste(cloth_resized, (x, y), mask)
-
-        # Save bytes
-        out_buf = BytesIO()
-        composed.save(out_buf, format="PNG")
+@@ -106,11 +156,81 @@ def tryon():
         out_buf.seek(0)
         img_bytes = out_buf.read()
 
@@ -175,15 +132,8 @@ def tryon():
                 model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
                 if instruction is None:
                     instruction = (
-                        text_input = """
-                        Overlay the given clothing item onto the person realistically. 
-                        Make it look like the clothing is naturally worn by the person, 
-                        adapting to their body shape, pose, and proportions. 
-                        Adjust lighting, shadows, folds, and perspective so it looks like 
-                        a professional fashion photo suitable for e-commerce. 
-                        Do not simply paste or overlay—blend it seamlessly.
-                        """
-
+                        "Overlay the given clothing item onto the person realistically,"
+                        " making it look like they are wearing it. Keep it clean and professional."
                     )
 
                 print("Sending images to Gemini via genai client, model:", model_name)
@@ -228,6 +178,9 @@ def tryon():
 
         # Upload to Supabase storage
         result_filename = f"tryon_results/{user_id}_{product_id}_{int(time.time())}.png"
+        upload_res = supabase.storage.from_(BUCKET).upload(result_filename, img_bytes, {"upsert": True})
+        if isinstance(upload_res, dict) and upload_res.get("error"):
+            return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         # pass upsert as a string to avoid boolean values being used as header values
         try:
             upload_res = supabase.storage.from_(BUCKET).upload(result_filename, img_bytes, {"upsert": "true"})
@@ -240,27 +193,3 @@ def tryon():
             return jsonify({"status": "error", "message": str(e), "type": str(e.__class__)}), 500
 
         result_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{result_filename}"
-
-        # Save metadata into DB
-        try:
-            insert_res = supabase.table("tryon_results").insert({
-                "user_id": user_id,
-                "product_id": product_id,
-                "user_image_url": user_image_url,
-                "cloth_image_url": cloth_image_url,
-                "result_url": result_url
-            }).execute()
-        except Exception as e:
-            # not critical for returning result, but log
-            print("DB insert error:", e)
-
-        return jsonify({"status": "success", "result_url": result_url})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
-
