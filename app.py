@@ -175,8 +175,15 @@ def tryon():
                 model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
                 if instruction is None:
                     instruction = (
-                        "Overlay the given first clothing item onto the second person realistically,"
-                        " making it look like they are wearing it. Keep it clean and professional."
+                        text_input = """
+                        Overlay the given clothing item onto the person realistically. 
+                        Make it look like the clothing is naturally worn by the person, 
+                        adapting to their body shape, pose, and proportions. 
+                        Adjust lighting, shadows, folds, and perspective so it looks like 
+                        a professional fashion photo suitable for e-commerce. 
+                        Do not simply paste or overlay—blend it seamlessly.
+                        """
+
                     )
 
                 print("Sending images to Gemini via genai client, model:", model_name)
@@ -256,3 +263,4 @@ def tryon():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
