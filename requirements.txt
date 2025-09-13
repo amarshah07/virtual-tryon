@@ -1,7 +1,8 @@
-Flask==2.3.3
-flask-cors==4.2.0
-Pillow==10.0.0
-supabase==3.0.0
-requests==2.32.0
-gunicorn==21.2.0
-google-generativeai==0.1.0
+Flask
+flask-cors
+Pillow
+supabase
+requests
+gunicorn
+google-generativeai
+
