@@ -1,195 +1,293 @@
+#!/usr/bin/env python3
+# app.py - Fixed version: uses Gemini properly (sends bytes + strong prompt)
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from PIL import Image
+import requests
+from io import BytesIO
 import os
 import time
 import traceback
 import base64
-# optional Google GenAI client (used in test.py flow)
+import json
+
+# optional Google GenAI client
 try:
     from google import genai  # type: ignore
-    from google.genai import types  # type: ignore
     _HAS_GENAI = True
 except Exception:
     genai = None
-    types = None
     _HAS_GENAI = False
+
 from supabase import create_client, Client
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIG from env ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # service role key (secret) - required
-SUPABASE_URL = "https://xetomtmbtiqwfisynrrl.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhldG9tdG1idGlxd2Zpc3lucnJsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzM0ODk0MywiZXhwIjoyMDcyOTI0OTQzfQ.a4Oh7YnHyEqSrJrFNI3gYoGz0FUjE5aoMMCRKRDla_k"  # service role key (secret) - required 
-print(SUPABASE_KEY)                                                 
+# --- CONFIG (use environment variables in production) ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://xetomtmbtiqwfisynrrl.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhldG9tdG1idGlxd2Zpc3lucnJsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzM0ODk0MywiZXhwIjoyMDcyOTI0OTQzfQ.a4Oh7YnHyEqSrJrFNI3gYoGz0FUjE5aoMMCRKRDla_k")
+BUCKET = os.environ.get("SUPABASE_BUCKET", "images")
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCxAcqc8gBVOMAlO0veJPjmBch1kWBQpgI")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
+GEMINI_MODE = os.environ.get("GEMINI_MODE", "base64")  # not used heavily here
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Please set SUPABASE_URL and SUPABASE_KEY environment variables")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-BUCKET = "images"  # ensure this exists in your Supabase project
 
-# Optional Gemini configuration (set in env when available)
+# --- Helpers ---
+def _pil_to_bytes(pil_img: Image.Image, fmt: str = "PNG") -> bytes:
+    buf = BytesIO()
+    pil_img.save(buf, format=fmt)
+    buf.seek(0)
+    return buf.read()
 
-GEMINI_API_KEY = "AIzaSyCxAcqc8gBVOMAlO0veJPjmBch1kWBQpgI"
-# Mode: 'base64' (default) or 'multipart' - how to send image to Gemini
-GEMINI_MODE = os.environ.get("GEMINI_MODE", "base64")
+def _bytes_to_pil(b: bytes) -> Image.Image:
+    return Image.open(BytesIO(b)).convert("RGBA")
 
+def _upload_to_supabase(bucket: str, path: str, file_bytes: bytes, content_type: str = "image/png") -> str:
+    """
+    Upload raw bytes to Supabase storage and return public URL.
+    """
+    try:
+        # supabase client expects bytes for upload
+        upload_res = supabase.storage.from_(bucket).upload(path, file_bytes, {"upsert": "true"})
+        if isinstance(upload_res, dict) and upload_res.get("error"):
+            raise RuntimeError(f"Supabase upload error: {upload_res.get('error')}")
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
+        return public_url
+    except Exception as e:
+        # bubble up
+        raise
+
+def send_to_gemini_images(user_image: Image.Image, cloth_image: Image.Image, instruction: str = None):
+    """
+    Send PNG bytes for cloth + user with a textual instruction to Gemini (via google.genai).
+    Returns dict: {'image_bytes': b'...','raw': response} OR {'raw': response} OR {'error': '...'}
+    """
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY not set in environment"}
+
+    if not _HAS_GENAI or genai is None:
+        return {"error": "google-genai client not installed (pip install google-genai)"}
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        model_name = GEMINI_MODEL or "gemini-2.5-flash-image-preview"
+        if instruction is None:
+            instruction = (
+                "Overlay the given clothing item onto the person realistically, "
+                "making it look like they are actually wearing it. Keep it clean and professional. "
+                "Check the fit and adjust the clothing item to match the person's pose and body shape. "
+                "Align clothing with shoulders, arms, and torso. Preserve correct proportions, blend shadows and lighting naturally. "
+                "Do not alter the person's face or background. Return only the final composite try-on image (inline image data)."
+            )
+
+        # Convert PIL images to PNG bytes (cloth first, then person - explicit)
+        cloth_bytes = _pil_to_bytes(cloth_image, fmt="PNG")
+        user_bytes = _pil_to_bytes(user_image, fmt="PNG")
+
+        print("Calling Gemini model:", model_name)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[cloth_bytes, user_bytes, instruction],
+        )
+
+        # Try to extract inline image bytes
+        image_parts = []
+        try:
+            # response.candidates[0].content.parts may contain inline_data
+            for part in response.candidates[0].content.parts:
+                inline = getattr(part, "inline_data", None)
+                if inline and getattr(inline, "data", None):
+                    image_parts.append(inline.data)
+        except Exception:
+            image_parts = []
+
+        if image_parts:
+            try:
+                normalized = Image.open(BytesIO(image_parts[0])).convert("RGBA")
+                buf = BytesIO()
+                normalized.save(buf, format="PNG")
+                buf.seek(0)
+                return {"image_bytes": buf.read(), "raw": response}
+            except Exception:
+                # return raw bytes if normalization fails
+                return {"image_bytes": image_parts[0], "raw": response}
+
+        return {"raw": response}
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
+
+# --- Routes ---
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "Xaze Try-On Backend Running 🚀"})
-@@ -36,6 +53,13 @@ def upload_user_image():
+
+@app.route("/upload_user_image", methods=["POST"])
+def upload_user_image():
+    try:
+        if "file" not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+
         file = request.files["file"]
         user_id = request.form.get("user_id", "anonymous")
 
-        # Diagnostic logging to help debug header/value issues
-        try:
-            print("upload_user_image: file attrs -> filename:", getattr(file, 'filename', None), "content_type:", getattr(file, 'content_type', None))
-        except Exception:
-            print("upload_user_image: unable to read file attrs")
-        print("upload_user_image: form keys:", list(request.form.keys()))
-
-        # read bytes
         file_bytes = file.read()
         ext = "png"
-@@ -44,10 +68,17 @@ def upload_user_image():
+        if "." in getattr(file, "filename", ""):
+            ext = file.filename.rsplit(".", 1)[1].lower()
+            if ext not in ("png", "jpg", "jpeg", "webp"):
+                ext = "png"
         filename = f"user_uploads/{user_id}_{int(time.time())}.{ext}"
 
-        # upload bytes to supabase storage (service role key on server)
-        upload_res = supabase.storage.from_(BUCKET).upload(filename, file_bytes, {"upsert": True})
-        # supabase-py may return dict with error, or object; check both
-        if isinstance(upload_res, dict) and upload_res.get("error"):
-            return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         try:
-            # pass raw bytes (supabase client expects str/bytes/os.PathLike)
             upload_res = supabase.storage.from_(BUCKET).upload(filename, file_bytes, {"upsert": "true"})
-            # supabase-py may return dict with error, or object; check both
             if isinstance(upload_res, dict) and upload_res.get("error"):
-                print("Supabase upload error (upload_user_image):", upload_res)
                 return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         except Exception as e:
             traceback.print_exc()
-            print("Supabase upload exception class:", e.__class__, "repr:", repr(e))
             return jsonify({"status": "error", "message": str(e), "type": str(e.__class__)}), 500
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
         return jsonify({"status": "success", "public_url": public_url, "file_path": filename})
-@@ -66,14 +97,33 @@ def tryon():
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/tryon", methods=["POST"])
+def tryon():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        user_id = data.get("user_id")
+        product_id = data.get("product_id")
         user_image_url = data.get("user_image_url")
         cloth_image_url = data.get("cloth_image_url")
+        custom_instruction = data.get("instruction")  # optional override
 
-        # Basic validation + clear error messages
         print("tryon payload:", data)
-
         if not user_id or not product_id:
             return jsonify({"status": "error", "message": "user_id and product_id required"}), 400
-
-        # Ensure image fields are strings (public URLs). Reject booleans or other types early.
         if not user_image_url or not cloth_image_url:
-            return jsonify({"status": "error", "message": "Image URLs missing"}), 400
-        if not isinstance(user_image_url, str):
-            return jsonify({"status": "error", "message": "user_image_url must be a string (public URL).", "type": str(type(user_image_url))}), 400
-        if not isinstance(cloth_image_url, str):
-            return jsonify({"status": "error", "message": "cloth_image_url must be a string (public URL).", "type": str(type(cloth_image_url))}), 400
+            return jsonify({"status": "error", "message": "user_image_url and cloth_image_url required"}), 400
 
-        # Download both images (timeout)
-        uresp = requests.get(user_image_url, timeout=15)
-        cresp = requests.get(cloth_image_url, timeout=15)
+        # Download images
         try:
-            uresp = requests.get(user_image_url, timeout=15)
+            uresp = requests.get(user_image_url, timeout=20)
+            uresp.raise_for_status()
+            cresp = requests.get(cloth_image_url, timeout=20)
+            cresp.raise_for_status()
         except Exception as e:
             traceback.print_exc()
-            return jsonify({"status": "error", "message": f"Failed to fetch user image: {e}"}), 400
+            return jsonify({"status": "error", "message": f"Failed to download images: {e}"}), 400
 
         try:
-            cresp = requests.get(cloth_image_url, timeout=15)
+            user_img = Image.open(BytesIO(uresp.content)).convert("RGBA")
+            cloth_img = Image.open(BytesIO(cresp.content)).convert("RGBA")
         except Exception as e:
             traceback.print_exc()
-            return jsonify({"status": "error", "message": f"Failed to fetch cloth image: {e}"}), 400
+            return jsonify({"status": "error", "message": f"Invalid image data: {e}"}), 400
 
-        if uresp.status_code != 200:
-            return jsonify({"status": "error", "message": f"Failed to fetch user image: {uresp.status_code}"}), 400
-        if cresp.status_code != 200:
-@@ -106,11 +156,81 @@ def tryon():
-        out_buf.seek(0)
-        img_bytes = out_buf.read()
-
-        # If configured, send composed image bytes to Gemini (optional)
-
-        def send_to_gemini_images(user_image: Image.Image, cloth_image: Image.Image, instruction: str = None):
-            """
-            Send PIL images + instruction to Gemini using the genai client (same as test.py).
-            This implementation requires `google-genai` and `GEMINI_API_KEY` set in env.
-            Returns dict with either 'image_bytes' (PNG) or 'raw' or 'error'.
-            """
-            if not GEMINI_API_KEY:
-                return {"error": "GEMINI_API_KEY not set in environment"}
-
-            if not _HAS_GENAI or genai is None:
-                return {"error": "google.genai client not installed (pip install google-genai)"}
-
-            try:
-                client = genai.Client(api_key=GEMINI_API_KEY)
-                model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image-preview")
-                if instruction is None:
-                    instruction = (
-                        "Overlay the given clothing item onto the person realistically,"
-                        " making it look like they are wearing it. Keep it clean and professional."
-                    )
-
-                print("Sending images to Gemini via genai client, model:", model_name)
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[cloth_image, user_image, instruction],
-                )
-
-                # Extract inline image bytes like test.py
-                try:
-                    image_parts = [
-                        part.inline_data.data
-                        for part in response.candidates[0].content.parts
-                        if getattr(part, "inline_data", None)
-                    ]
-                except Exception:
-                    image_parts = []
-
-                if image_parts:
-                    try:
-                        out_img = Image.open(BytesIO(image_parts[0]))
-                        out_buf2 = BytesIO()
-                        out_img.save(out_buf2, format="PNG")
-                        out_buf2.seek(0)
-                        print("Received image parts from Gemini and normalized to PNG")
-                        return {"image_bytes": out_buf2.read(), "raw": response}
-                    except Exception:
-                        print("Received image parts but failed to normalize; returning raw bytes")
-                        return {"image_bytes": image_parts[0], "raw": response}
-
-                return {"raw": response}
-            except Exception as e:
-                traceback.print_exc()
-                return {"error": str(e)}
-
-        # Fire and log Gemini result (try genai client first)
+        # Prepare a local PIL fallback composed image (in case Gemini fails)
         try:
-            gemini_resp = send_to_gemini_images(user_img, cloth_img)
-            print("gemini_resp:", gemini_resp)
+            base = user_img.copy()
+            target_w = int(base.width * 0.7)
+            scale = target_w / max(1, cloth_img.width)
+            target_h = int(cloth_img.height * scale)
+            cloth_resized = cloth_img.resize((target_w, target_h), Image.LANCZOS)
+
+            x = int((base.width - target_w) / 2)
+            y = int(base.height * 0.25)
+
+            mask = cloth_resized.split()[3]
+            if mask.getextrema() == (0, 0):
+                gray = cloth_resized.convert("L")
+                mask = gray.point(lambda p: 255 if p < 250 else 0)
+
+            composed = base.copy()
+            composed.paste(cloth_resized, (x, y), mask)
+            fallback_bytes = _pil_to_bytes(composed, fmt="PNG")
         except Exception:
             traceback.print_exc()
+            fallback_bytes = None
+
+        # Try Gemini (preferred)
+        final_image_bytes = None
+        used_backend = None
+
+        if _HAS_GENAI and GEMINI_API_KEY:
+            try:
+                gemini_resp = send_to_gemini_images(
+                    user_img,
+                    cloth_img,
+                    instruction=custom_instruction or (
+                        "Overlay the given clothing item onto the person realistically, "
+                        "making it look like they are actually wearing it. Keep it clean and professional. "
+                        "Check the fit and adjust the clothing item to match the person's pose and body shape. "
+                        "Align clothing with shoulders, arms, and torso. Preserve correct proportions, blend shadows and lighting naturally. "
+                        "Do not alter the person's face or background. Return only the final composite try-on image (inline image data)."
+                    )
+                )
+                print("gemini_resp keys:", list(gemini_resp.keys()))
+            except Exception:
+                traceback.print_exc()
+                gemini_resp = {"error": "Exception calling Gemini"}
+
+            if gemini_resp.get("image_bytes"):
+                final_image_bytes = gemini_resp["image_bytes"]
+                used_backend = "gemini"
+            else:
+                # debug messages to logs
+                if gemini_resp.get("error"):
+                    print("Gemini returned error:", gemini_resp.get("error"))
+                else:
+                    print("Gemini returned no inline image. gemini_resp keys:", list(gemini_resp.keys()))
+        else:
+            print("Gemini client not available or GEMINI_API_KEY not set. Skipping Gemini.")
+
+        # If Gemini failed, use fallback PIL composition (if available)
+        if final_image_bytes is None:
+            if fallback_bytes:
+                final_image_bytes = fallback_bytes
+                used_backend = "local_pil"
+            else:
+                return jsonify({"status": "error", "message": "Both Gemini and local fallback failed"}), 500
 
         # Upload to Supabase storage
         result_filename = f"tryon_results/{user_id}_{product_id}_{int(time.time())}.png"
-        upload_res = supabase.storage.from_(BUCKET).upload(result_filename, img_bytes, {"upsert": True})
-        if isinstance(upload_res, dict) and upload_res.get("error"):
-            return jsonify({"status": "error", "message": upload_res.get("error")}), 500
-        # pass upsert as a string to avoid boolean values being used as header values
         try:
-            upload_res = supabase.storage.from_(BUCKET).upload(result_filename, img_bytes, {"upsert": "true"})
+            upload_res = supabase.storage.from_(BUCKET).upload(result_filename, final_image_bytes, {"upsert": "true"})
             if isinstance(upload_res, dict) and upload_res.get("error"):
                 print("Supabase upload error (tryon result):", upload_res)
                 return jsonify({"status": "error", "message": upload_res.get("error")}), 500
         except Exception as e:
             traceback.print_exc()
-            print("Supabase upload exception class (tryon result):", e.__class__, "repr:", repr(e))
             return jsonify({"status": "error", "message": str(e), "type": str(e.__class__)}), 500
 
         result_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{result_filename}"
+
+        # Save metadata into DB (non-critical)
+        try:
+            supabase.table("tryon_results").insert({
+                "user_id": user_id,
+                "product_id": product_id,
+                "user_image_url": user_image_url,
+                "cloth_image_url": cloth_image_url,
+                "result_url": result_url,
+                "used_backend": used_backend
+            }).execute()
+        except Exception as e:
+            print("DB insert error:", e)
+
+        return jsonify({"status": "success", "result_url": result_url, "used_backend": used_backend})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
