@@ -214,7 +214,20 @@ def tryon():
 
         # Fire and log Gemini result (try genai client first)
         try:
-            gemini_resp = send_to_gemini_images(user_img, cloth_img)
+            gemini_resp = send_to_gemini_images(
+                user_img,
+                cloth_img,
+                instruction=(
+                    "Overlay the given clothing item onto the person realistically, "
+                    "making it look like they are actually wearing it. "
+                    "Keep it clean and professional. "
+                    "Check the fit and adjust the clothing item to match the person's pose and body shape. "
+                    "Align clothing with shoulders, arms, and torso. "
+                    "Preserve correct proportions, blend shadows and lighting naturally. "
+                    "Do not alter the person’s face, skin, or background. "
+                    "Return only the final composite try-on image."
+                )
+            )
             print("gemini_resp:", gemini_resp)
         except Exception:
             traceback.print_exc()
